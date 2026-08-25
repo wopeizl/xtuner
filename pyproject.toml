@@ -68,6 +68,9 @@ path = "xtuner/version.py"
 allow-direct-references = true
 
 [project.optional-dependencies]
+deepmoe = [
+  "deepmoe @ git+https://github.com/wopeizl/deepmoe.git@ac5a514",
+]
 rl = [
   "ray[default]",
   "httpx",

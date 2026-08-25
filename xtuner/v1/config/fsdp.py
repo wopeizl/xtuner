@@ -47,8 +47,8 @@ class FSDPConfig(BaseModel):
     ] = None
 
     def model_post_init(self, __context: Any) -> None:
-        if self.hsdp_sharding_size is not None:
-            assert self.ep_size == 1, "Currently, HSDP requires expert parallel size to be 1"
+        if self.hsdp_sharding_size is not None and self.hsdp_sharding_size <= 0:
+            raise ValueError("hsdp_sharding_size must be positive")
 
     @field_serializer("param_dtype", "reduce_dtype")
     def serialize_param_dtype(self, value: torch.dtype) -> str:

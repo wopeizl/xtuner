@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Literal, Protocol, TypeAlias, cast
+from typing import Any, Literal, Protocol, TypeAlias, cast
 
 import torch
 import torch.nn as nn
@@ -203,6 +203,8 @@ class MoEBlock(nn.Module):
 class MoEDecoderLayer(nn.Module):
     """MoE decoder layer."""
 
+    _deepmoe_runtime: Any | None
+
     def __init__(
         self,
         *,
@@ -229,10 +231,14 @@ class MoEDecoderLayer(nn.Module):
         moe_act_fn_cfg: MoEActFnConfig,
         float8_cfg: Float8Config | None = None,
         layer_idx: int = 0,
-        dispatcher: Literal["deepep", "all2all", "agrs"] | None,
+        dispatcher: Literal["deepep", "all2all", "agrs", "deepmoe", "moonep", "ultraep"] | None,
         ep_mesh: DeviceMesh | None = None,
         expert_tp_mesh: DeviceMesh | None = None,
         ep_tp_mesh: DeviceMesh | None = None,
+        deepmoe_runtime: Any | None = None,
+        deepmoe_bank_index: int | None = None,
+        deepmoe_router: MoEGate | None = None,
+        deepmoe_layer: nn.Module | None = None,
     ):
         super().__init__()
         self.ep_mesh = ep_mesh
@@ -257,7 +263,7 @@ class MoEDecoderLayer(nn.Module):
         self.shared_expert_gate: nn.Module | None
         self.shared_experts: MoEMLP | None
 
-        if n_shared_experts > 0:
+        if n_shared_experts > 0 and deepmoe_layer is None:
             self.shared_experts = MoEMLP(
                 hidden_size=hidden_size,
                 n_shared_experts=n_shared_experts,
@@ -274,38 +280,77 @@ class MoEDecoderLayer(nn.Module):
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
 
-        self.gate = MoEGate(
-            hidden_size=hidden_size,
-            n_routed_experts=n_routed_experts,
-            num_experts_per_tok=num_experts_per_tok,
-            router_config=router_config,
-            gate_bias=gate_bias,
-            router_compute_dtype=router_compute_dtype,
-        )
-        self.experts = MoEBlock(
-            hidden_size=hidden_size,
-            moe_intermediate_size=moe_intermediate_size,
-            n_routed_experts=n_routed_experts,
-            moe_bias=moe_bias,
-            ep_mesh=ep_mesh,
-            expert_tp_mesh=expert_tp_mesh,
-            float8_cfg=float8_cfg,
-            moe_act_fn_cfg=moe_act_fn_cfg,
-            ep_tp_mesh=ep_tp_mesh,
-        )
-        # TODO: (yehaochen) Maybe should be replaced by build_dispatcher
-        process_group = ep_mesh.get_group() if ep_mesh is not None else None
-        tp_group = expert_tp_mesh.get_group() if expert_tp_mesh is not None else None
-        ep_tp_group = ep_tp_mesh._flatten().get_group() if ep_tp_mesh is not None else None
-        self.dispatcher = build_dispatcher(
-            dispatcher=dispatcher,
-            n_routed_experts=n_routed_experts,
-            ep_group=process_group,
-            tp_group=tp_group,
-            ep_tp_group=ep_tp_group,
-            training_dtype="fp8" if float8_cfg is not None else "bf16",
-            generate_dtype=generate_config.dtype if generate_config is not None else "bf16",
-        )
+        object.__setattr__(self, "_deepmoe_runtime", deepmoe_runtime)
+        self._deepmoe_bank_index = deepmoe_bank_index
+        self._last_deepmoe_aux: Any | None = None
+        if deepmoe_layer is not None:
+            if deepmoe_runtime is not None:
+                raise ValueError("DeepMoE full layer and specialized runtime are mutually exclusive")
+            if dispatcher != "deepmoe":
+                raise ValueError("DeepMoE full layer requires dispatcher='deepmoe'")
+            self.deepmoe_layer: nn.Module | None = deepmoe_layer
+            object.__setattr__(self, "gate", deepmoe_layer.router)
+            self.experts = None
+            self.dispatcher = None
+        elif deepmoe_runtime is not None:
+            self.deepmoe_layer = None
+            runtime_backend = getattr(deepmoe_runtime, "backend", None)
+            if dispatcher != runtime_backend:
+                raise ValueError(
+                    f"DeepMoE runtime backend {runtime_backend!r} does not match dispatcher={dispatcher!r}"
+                )
+            if deepmoe_bank_index is None or deepmoe_router is None:
+                raise ValueError("DeepMoE requires an explicit model-owned bank index and router")
+            # The top-level model is the only registered owner of the shared
+            # router banks and runtime. Decoder layers hold non-owning aliases
+            # so parameters have one canonical state-dict path.
+            object.__setattr__(self, "gate", deepmoe_router)
+            self.experts = None
+            self.dispatcher = None
+        else:
+            self.deepmoe_layer = None
+            self.gate = MoEGate(
+                hidden_size=hidden_size,
+                n_routed_experts=n_routed_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                router_config=router_config,
+                gate_bias=gate_bias,
+                router_compute_dtype=router_compute_dtype,
+            )
+            self.experts = MoEBlock(
+                hidden_size=hidden_size,
+                moe_intermediate_size=moe_intermediate_size,
+                n_routed_experts=n_routed_experts,
+                moe_bias=moe_bias,
+                ep_mesh=ep_mesh,
+                expert_tp_mesh=expert_tp_mesh,
+                float8_cfg=float8_cfg,
+                moe_act_fn_cfg=moe_act_fn_cfg,
+                ep_tp_mesh=ep_tp_mesh,
+            )
+            # TODO: (yehaochen) Maybe should be replaced by build_dispatcher
+            process_group = ep_mesh.get_group() if ep_mesh is not None else None
+            tp_group = expert_tp_mesh.get_group() if expert_tp_mesh is not None else None
+            ep_tp_group = ep_tp_mesh._flatten().get_group() if ep_tp_mesh is not None else None
+            self.dispatcher = build_dispatcher(
+                dispatcher=dispatcher,
+                n_routed_experts=n_routed_experts,
+                ep_group=process_group,
+                tp_group=tp_group,
+                ep_tp_group=ep_tp_group,
+                training_dtype="fp8" if float8_cfg is not None else "bf16",
+                generate_dtype=generate_config.dtype if generate_config is not None else "bf16",
+            )
+
+    def take_deepmoe_aux(self) -> Any | None:
+        """Take the DeepMoE auxiliary result produced by the last forward.
+
+        Returns:
+            Any | None: DeepMoE ``MoEAux`` for the last invocation, if this is
+                a complete DeepMoE layer.
+        """
+        aux, self._last_deepmoe_aux = self._last_deepmoe_aux, None
+        return aux
 
     def forward(
         self,
@@ -352,6 +397,7 @@ class MoEDecoderLayer(nn.Module):
             )
 
     def _hf_expert_forward_for_debug(self, hidden_states: torch.Tensor, router_results: RouterResults, origin_shape):
+        assert self.experts is not None, "HF expert debug path is unavailable for DeepMoE"
         # xtuner: num_experts * 2 * expert_dim, hidden_size
         # hf: num_experts, 2 * expert_dim, hidden_size
         origin_gate_up_proj = self.experts.fused_w1w3.weight
@@ -395,15 +441,106 @@ class MoEDecoderLayer(nn.Module):
         seq_ctx: SequenceContext,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[HiddenStates, RouterLogits, RouterWeights, RouterTopKIds]:
-        residual, hidden_states, router_results = self._pre_moe_forward(
-            hidden_states=hidden_states,
-            seq_ctx=seq_ctx,
-            position_embeddings=position_embeddings,
-            state=ForwardState.TRAINING,
-        )
+        if self.deepmoe_layer is not None:
+            if getattr(seq_ctx, "rollout_routed_experts", None) is not None:
+                raise RuntimeError("DeepMoE full layer does not support replaying XTuner rollout routes")
+            residual, moe_input = self._pre_moe_input_forward(
+                hidden_states=hidden_states,
+                seq_ctx=seq_ctx,
+                position_embeddings=position_embeddings,
+                state=ForwardState.TRAINING,
+            )
+            combined_hidden_states, aux = self.deepmoe_layer(
+                moe_input,
+                token_mask=seq_ctx.mask,
+                collect_router_stats=True,
+            )
+            self._last_deepmoe_aux = aux
+            if aux.router_logits is None or aux.topk_weights is None or aux.topk_expert_ids is None:
+                raise RuntimeError("DeepMoE full layer did not return router statistics")
+            output = self._post_moe_forward(
+                combined_hidden_states=combined_hidden_states,
+                residual=residual,
+                shared_experts_out=None,
+            )
+            return output, aux.router_logits, aux.topk_weights, aux.topk_expert_ids
+
+        deepmoe_runtime = self._deepmoe_runtime
+        generation = None
+        if deepmoe_runtime is not None and getattr(deepmoe_runtime, "backend", None) == "ultraep":
+            generation = deepmoe_runtime.new_generation(layer_idx=self.layer_idx)
+            hidden_states = deepmoe_runtime.wrap_transformer_input(
+                hidden_states,
+                layer_idx=self.layer_idx,
+                generation=generation,
+            )
+        try:
+            residual, hidden_states, router_results = self._pre_moe_forward(
+                hidden_states=hidden_states,
+                seq_ctx=seq_ctx,
+                position_embeddings=position_embeddings,
+                state=ForwardState.TRAINING,
+            )
+        except BaseException:
+            if generation is not None:
+                generation.close()
+            raise
 
         origin_shape = hidden_states.shape
 
+        if deepmoe_runtime is not None:
+            assert self._deepmoe_bank_index is not None
+            try:
+                runtime_kwargs = (
+                    {"layer_idx": self.layer_idx, "generation": generation} if generation is not None else {}
+                )
+                combined_hidden_states = deepmoe_runtime(
+                    self._deepmoe_bank_index,
+                    hidden_states.view(-1, hidden_states.shape[-1]),
+                    router_results["topk_ids"],
+                    router_results["topk_weights"],
+                    router_results["topkens_per_expert"],
+                    **runtime_kwargs,
+                ).view(*origin_shape)
+            finally:
+                if generation is not None:
+                    generation.close()
+        else:
+            assert self.dispatcher is not None
+            assert self.experts is not None
+            combined_hidden_states = self._run_dispatched_experts(hidden_states, router_results, origin_shape)
+
+        # debug for aligning with hf implementation.
+        # combined_hidden_states = self._hf_expert_forward_for_debug(hidden_states, router_results, origin_shape)
+
+        # ProberList.after_combine(self.layer_idx, combined_hidden_states)
+
+        if self.n_shared_experts > 0:
+            shared_experts_out = self._shared_experts_forward(hidden_states=hidden_states)
+        else:
+            shared_experts_out = None
+
+        hidden_states = self._post_moe_forward(
+            combined_hidden_states=combined_hidden_states,
+            residual=residual,
+            shared_experts_out=shared_experts_out,
+        )
+        return (
+            hidden_states,
+            router_results["logits"],
+            router_results["router_weights"],
+            router_results["topk_ids"],
+        )
+
+    def _run_dispatched_experts(
+        self,
+        hidden_states: torch.Tensor,
+        router_results: RouterResults,
+        origin_shape: torch.Size,
+    ) -> torch.Tensor:
+        """Run XTuner's existing dispatcher and grouped-expert path."""
+        assert self.dispatcher is not None
+        assert self.experts is not None
         # reshape hidden_states to (batch_size * seq_len, hidden_size)
         # ProberList.before_dispatch(
         #     self.layer_idx, hidden_states, router_results["topk_ids"], router_results["topk_weights"]
@@ -465,27 +602,7 @@ class MoEDecoderLayer(nn.Module):
         combined_hidden_states = post_combined["hidden_states"]
         combined_hidden_states = combined_hidden_states.view(*origin_shape)
 
-        # debug for aligning with hf implementation.
-        # combined_hidden_states = self._hf_expert_forward_for_debug(hidden_states, router_results, origin_shape)
-
-        # ProberList.after_combine(self.layer_idx, combined_hidden_states)
-
-        if self.n_shared_experts > 0:
-            shared_experts_out = self._shared_experts_forward(hidden_states=hidden_states)
-        else:
-            shared_experts_out = None
-
-        hidden_states = self._post_moe_forward(
-            combined_hidden_states=combined_hidden_states,
-            residual=residual,
-            shared_experts_out=shared_experts_out,
-        )
-        return (
-            hidden_states,
-            router_results["logits"],
-            router_results["router_weights"],
-            router_results["topk_ids"],
-        )
+        return combined_hidden_states
 
     def _micro_batch_forward(
         self,
@@ -493,6 +610,10 @@ class MoEDecoderLayer(nn.Module):
         seq_ctx_list: list[SequenceContext],
         position_embeddings_list: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> tuple[torch.Tensor, ...]:
+        if self.deepmoe_layer is not None or self._deepmoe_runtime is not None:
+            raise RuntimeError("DeepMoE does not support async intra-layer microbatch overlap")
+        assert self.dispatcher is not None
+        assert self.experts is not None
         origin_shape = hidden_states_list[0].shape
         assert all(hidden_states.shape == origin_shape for hidden_states in hidden_states_list), (
             "All hidden states should have the same shape"
@@ -633,6 +754,34 @@ class MoEDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, RouterResults]:
         # NOTE: In order to allow `torch.compile` to compile the ops before and after attention as much as possible,
         # attention, post-layernorm and gate are implemented in one function
+        residual, hidden_states = self._pre_moe_input_forward(
+            hidden_states=hidden_states,
+            seq_ctx=seq_ctx,
+            position_embeddings=position_embeddings,
+            state=state,
+            past_key_values=past_key_values,
+        )
+
+        if seq_ctx.rollout_routed_experts is not None and self.layer_idx < seq_ctx.rollout_routed_experts.shape[1]:
+            rollout_routed_experts = seq_ctx.rollout_routed_experts[:, self.layer_idx, :]  # seq_l, expert
+            # TODO: pin_memory() + to(device, non_blocking=True) on a CUDA stream would allow overlapping the transfer
+            # with prior-layer compute
+            if seq_ctx.offload_rollout_routed_experts and rollout_routed_experts.device != hidden_states.device:
+                rollout_routed_experts = rollout_routed_experts.contiguous()
+                rollout_routed_experts = rollout_routed_experts.to(hidden_states.device)
+        else:
+            rollout_routed_experts = None
+        router_results: RouterResults = self.gate(hidden_states, rollout_routed_experts)
+        return residual, hidden_states, router_results
+
+    def _pre_moe_input_forward(
+        self,
+        hidden_states: torch.Tensor,
+        seq_ctx: SequenceContext,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        state: ForwardState,
+        past_key_values: list[list[torch.Tensor]] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -666,17 +815,7 @@ class MoEDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        if seq_ctx.rollout_routed_experts is not None and self.layer_idx < seq_ctx.rollout_routed_experts.shape[1]:
-            rollout_routed_experts = seq_ctx.rollout_routed_experts[:, self.layer_idx, :]  # seq_l, expert
-            # TODO: pin_memory() + to(device, non_blocking=True) on a CUDA stream would allow overlapping the transfer
-            # with prior-layer compute
-            if seq_ctx.offload_rollout_routed_experts and rollout_routed_experts.device != hidden_states.device:
-                rollout_routed_experts = rollout_routed_experts.contiguous()
-                rollout_routed_experts = rollout_routed_experts.to(hidden_states.device)
-        else:
-            rollout_routed_experts = None
-        router_results: RouterResults = self.gate(hidden_states, rollout_routed_experts)
-        return residual, hidden_states, router_results
+        return residual, hidden_states
 
     def _shared_experts_forward(
         self,
@@ -699,7 +838,7 @@ class MoEDecoderLayer(nn.Module):
         residual: torch.Tensor,
         shared_experts_out: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self.n_shared_experts > 0:
+        if self.shared_experts is not None:
             shared_experts_out = cast(torch.Tensor, shared_experts_out)
             combined_hidden_states = combined_hidden_states + shared_experts_out
         return combined_hidden_states * self.hidden_factor + residual

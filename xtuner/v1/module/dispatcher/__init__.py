@@ -28,7 +28,7 @@ logger = get_logger()
 # TODO: (yehaochen) This interface declaration does not follow the Liskov Substitution Principle.
 # Maybe we should find a better way to handle the dispatchers.
 def build_dispatcher(
-    dispatcher: Literal["deepep", "all2all", "agrs"] | None,
+    dispatcher: Literal["deepep", "all2all", "agrs", "deepmoe", "moonep", "ultraep"] | None,
     n_routed_experts: int,
     ep_group: dist.ProcessGroup | None = None,
     tp_group: dist.ProcessGroup | None = None,
@@ -36,6 +36,12 @@ def build_dispatcher(
     training_dtype: Literal["bf16", "fp8"] = "bf16",
     generate_dtype: Literal["bf16", "fp8"] = "bf16",
 ) -> DispacherInterface:
+    if dispatcher in {"deepmoe", "moonep", "ultraep"}:
+        raise ValueError(
+            f"dispatcher={dispatcher!r} is a model-owned DeepMoE runtime and cannot be "
+            "constructed by build_dispatcher()"
+        )
+
     if ep_group is None or ep_group.size() == 1:
         if dispatcher is not None:
             log_rank0.warning(f"{dispatcher} will not be used because the ep group is None.")
@@ -93,7 +99,9 @@ def build_dispatcher(
             generate_dtype=generate_dtype,
         )  # type: ignore[return-value]
     else:
-        raise ValueError(f"Unknown dispatcher name: {dispatcher}, name must be one of 'deepep' or 'all2all'.")
+        raise ValueError(
+            f"Unknown dispatcher name: {dispatcher}; expected deepep, all2all, agrs, deepmoe, moonep, or ultraep."
+        )
 
 
 __all__ = [

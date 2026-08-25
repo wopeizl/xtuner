@@ -24,11 +24,20 @@ from .dense.qwen3 import Qwen3Dense0P6BConfig, Qwen3Dense4BConfig, Qwen3Dense8BC
 from .moe.deepseek_v3 import DeepSeekV3Config
 from .moe.glm52 import Glm52MoEConfig
 from .moe.gpt_oss import GptOss21BA3P6Config, GptOss117BA5P8Config, GptOssConfig
-from .moe.moe import BalancingLossConfig, MoE, MoEConfig, MoEModelOutputs, ZLossConfig
-from .moe.qwen3 import Qwen3MoE30BA3Config, Qwen3MoEConfig, Qwen3MoEFoPEConfig
+from .moe.moe import (
+    BalancingLossConfig,
+    MoE,
+    MoEConfig,
+    MoEModelOutputs,
+    ZLossConfig,
+    build_deepmoe_model,
+    deepmoe_model_session,
+)
+from .moe.qwen3 import Qwen3MetaMoE10BA1BConfig, Qwen3MoE30BA3Config, Qwen3MoEConfig, Qwen3MoEFoPEConfig
 
 
 model_mapping = {
+    "qwen3-meta-moe": Qwen3MetaMoE10BA1BConfig(),
     "qwen3-moe-30BA3": Qwen3MoE30BA3Config(),
     "qwen3-8B": Qwen3Dense8BConfig(),
     "qwen3-4B": Qwen3Dense4BConfig(),
@@ -79,6 +88,7 @@ __all__ = [
     "Qwen3Dense8BConfig",
     "Qwen3MoEConfig",
     "Qwen3MoE30BA3Config",
+    "Qwen3MetaMoE10BA1BConfig",
     "Glm52MoEConfig",
     "InternS1Config",
     "InternS1MiniConfig",
@@ -95,6 +105,8 @@ __all__ = [
     "MoE",
     "MoEConfig",
     "MoEModelOutputs",
+    "build_deepmoe_model",
+    "deepmoe_model_session",
     "BalancingLossConfig",
     "ZLossConfig",
     "GreedyRouterConfig",

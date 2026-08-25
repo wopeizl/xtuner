@@ -654,6 +654,7 @@ class BaseModel(nn.Module):
         reshard_after_forward: bool,
         offload_policy: CPUOffloadPolicy | None,
         module: nn.Module | None = None,
+        extra_ignored_params: set[nn.Parameter] | None = None,
     ) -> None:
         def traverse(module):
             for name, param in module.named_parameters(recurse=False):
@@ -704,7 +705,7 @@ class BaseModel(nn.Module):
         # full path (e.g. `"embed_tokens.weight"`) and filter to `target`'s parameters
         # using identity comparison.
         full_param_name_mapping = {id(param): name for name, param in self.named_parameters()}
-        ignored_params: set[nn.Parameter] = set()
+        ignored_params = set() if extra_ignored_params is None else set(extra_ignored_params)
         patterns = self.config.hf_save_cfg.fp32_keys_pattern
 
         target = module or self

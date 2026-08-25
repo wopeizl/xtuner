@@ -1,8 +1,9 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import os
 import types
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, Self, Sequence, TypedDict, cast
+from typing import TYPE_CHECKING, Annotated, Any, Iterator, Literal, Sequence, TypedDict, cast
 
 import torch
 import torch.distributed as dist
@@ -20,7 +21,7 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from tqdm import tqdm
-from typing_extensions import overload, override
+from typing_extensions import Self, overload, override
 
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import DSATopKCacheState, SequenceContext
@@ -148,7 +149,16 @@ class MoEConfig(TransformerConfig):
     moe_intermediate_size: Annotated[int, Parameter(group="moe")]
     ep_size: Annotated[int, Parameter(group="moe")] = 1
     expert_tp_size: Annotated[int, Parameter(group="moe")] = 1
-    dispatcher: Annotated[Literal["deepep", "all2all", "agrs"] | None, Parameter(group="moe")] = None
+    dispatcher: Annotated[
+        Literal["deepep", "all2all", "agrs", "deepmoe", "moonep", "ultraep"] | None,
+        Parameter(group="moe"),
+    ] = None
+    moonep_sequence_length: Annotated[int, Parameter(group="moe")] = 32
+    moonep_num_sms: Annotated[int | None, Parameter(group="moe")] = None
+    ultraep_max_tokens_per_rank: Annotated[int, Parameter(group="moe")] = 32
+    ultraep_num_redundant_experts_per_rank: Annotated[int, Parameter(group="moe")] = 1
+    ultraep_architecture: Annotated[Literal["auto", "sm90", "sm100"], Parameter(group="moe")] = "auto"
+    ultraep_num_sms: Annotated[int | None, Parameter(group="moe")] = None
     router: GreedyRouterConfig | NoAuxRouterConfig
     balancing_loss_cfg: BalancingLossConfig | None = BalancingLossConfig()
     z_loss_cfg: ZLossConfig | None = None
@@ -170,6 +180,11 @@ class MoEConfig(TransformerConfig):
     def build(self) -> "MoE":
         from xtuner.v1.model.moe.moe import MoE
 
+        if self.dispatcher in {"deepmoe", "moonep", "ultraep"}:
+            from xtuner.v1.integrations.deepmoe import validate_deepmoe_model_config
+
+            validate_deepmoe_model_config(self)
+
         return MoE(self)
 
 
@@ -190,6 +205,8 @@ class MoE(BaseModel):
     ep_mesh: DeviceMesh | None = None
     expert_tp_mesh: DeviceMesh | None = None
     ep_tp_mesh: DeviceMesh | None = None
+    deepmoe_runtime: Any | None
+    deepmoe_router_banks: nn.ModuleList | None
 
     def __init__(self, config: MoEConfig):
         # Concrete MoE configs override build(), so validate dispatcher support
@@ -201,7 +218,18 @@ class MoE(BaseModel):
             assert config.ep_size == config.router.router_n_groups == 8, (
                 "Currently, AGRS dispatcher requires ep_size and router_n_groups to be 8"
             )
+        if config.dispatcher in {"deepmoe", "moonep", "ultraep"}:
+            from xtuner.v1.integrations.deepmoe import validate_deepmoe_model_config
 
+            validate_deepmoe_model_config(config)
+        self._deepmoe_closed = False
+        try:
+            self._initialize(config)
+        except BaseException:
+            self._close_deepmoe_after_construction_failure()
+            raise
+
+    def _initialize(self, config: MoEConfig) -> None:
         super().__init__(config)
         ep_size = config.ep_size if config.ep_size is not None else 1
         expert_tp_size = config.expert_tp_size if config.expert_tp_size > 1 else 1
@@ -239,6 +267,8 @@ class MoE(BaseModel):
             self.expert_tp_mesh = None
             self.ep_tp_mesh = None
 
+        self.deepmoe_runtime = self._build_deepmoe_runtime(config)
+        self.deepmoe_router_banks = self._build_deepmoe_router_banks(config)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)
 
@@ -261,10 +291,136 @@ class MoE(BaseModel):
             num_experts_per_tok=self.config.num_experts_per_tok,
         )
 
+    def _build_deepmoe_runtime(self, config: MoEConfig) -> Any | None:
+        if config.dispatcher not in {"moonep", "ultraep"}:
+            return None
+        if self.ep_mesh is None:
+            raise RuntimeError("DeepMoE requires an EP process group")
+        from xtuner.v1.integrations.deepmoe import build_deepmoe_runtime
+
+        common = {
+            "top_k": config.num_experts_per_tok,
+            "num_experts": config.n_routed_experts,
+            "hidden_size": config.hidden_size,
+            "intermediate_size": config.moe_intermediate_size,
+            "ep_size": config.ep_size,
+            "group": self.ep_mesh.get_group(),
+        }
+        if config.dispatcher == "moonep":
+            return build_deepmoe_runtime(
+                backend="moonep",
+                sequence_length=config.moonep_sequence_length,
+                num_sms=config.moonep_num_sms,
+                **common,
+            )
+        return build_deepmoe_runtime(
+            backend="ultraep",
+            num_layers=config.num_hidden_layers,
+            max_tokens_per_rank=config.ultraep_max_tokens_per_rank,
+            num_local_redundant_experts=config.ultraep_num_redundant_experts_per_rank,
+            architecture=config.ultraep_architecture,
+            num_sms_dispatch=config.ultraep_num_sms,
+            num_sms_combine=config.ultraep_num_sms,
+            **common,
+        )
+
+    def _build_deepmoe_router_banks(self, config: MoEConfig) -> nn.ModuleList | None:
+        if self.deepmoe_runtime is None:
+            return None
+        banks = getattr(self.deepmoe_runtime, "banks", None)
+        if banks is None or len(banks) != 4:
+            raise RuntimeError("DeepMoE MetaMoE requires exactly four expert banks")
+        return nn.ModuleList(
+            [
+                MoEGate(
+                    hidden_size=config.hidden_size,
+                    n_routed_experts=config.n_routed_experts,
+                    num_experts_per_tok=config.num_experts_per_tok,
+                    router_config=config.router,
+                    gate_bias=config.gate_bias,
+                    router_compute_dtype=config.router_compute_dtype,
+                )
+                for _ in range(len(banks))
+            ]
+        )
+
+    def _close_deepmoe_after_construction_failure(self) -> None:
+        runtime = getattr(self, "deepmoe_runtime", None)
+        if runtime is not None and not getattr(runtime, "closed", False):
+            collective = not dist.is_initialized() or dist.get_world_size() == 1
+            runtime.close(collective=collective)
+        for layer in getattr(self, "layers", {}).values():
+            deepmoe_layer = getattr(layer, "deepmoe_layer", None)
+            if deepmoe_layer is not None:
+                deepmoe_layer.close()
+        self._deepmoe_closed = True
+
+    def close(self, *, collective: bool = True) -> None:
+        """Release model-owned DeepMoE resources before process-group teardown."""
+        if self._deepmoe_closed:
+            return
+        runtime = getattr(self, "deepmoe_runtime", None)
+        if runtime is not None:
+            runtime.close(collective=collective)
+        for layer in getattr(self, "layers", {}).values():
+            deepmoe_layer = getattr(layer, "deepmoe_layer", None)
+            if deepmoe_layer is not None:
+                deepmoe_layer.close()
+        self._deepmoe_closed = True
+
+    def _apply(self, fn, recurse: bool = True):
+        """Reject whole-model dtype conversion before partially mutating children."""
+        runtime = getattr(self, "deepmoe_runtime", None)
+        if runtime is not None and len(runtime.banks):
+            master = runtime.banks[0].gate_weight
+            probe = torch.empty(0, dtype=torch.float32, device=master.device)
+            if fn(probe).dtype != torch.float32:
+                raise TypeError(
+                    "DeepMoE fp32 optimizer masters cannot be converted to another dtype; "
+                    "move devices without passing dtype"
+                )
+        return super()._apply(fn, recurse=recurse)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: object, _exc: object, _traceback: object) -> None:
+        self.close(collective=exc_type is None)
+
     @override
     @torch.no_grad()
     def init_weights(self) -> None:
-        super().init_weights()
+        if self.config.dispatcher == "deepmoe":
+            from xtuner.v1.utils import default_init_weights
+
+            initialized_params = default_init_weights(self)
+            for layer_name, decoder_layer in self.layers.items():
+                deepmoe_layer = cast(Any, decoder_layer).deepmoe_layer
+                if deepmoe_layer is None:
+                    continue
+                deepmoe_layer.reset_parameters()
+                prefix = f"layers.{layer_name}.deepmoe_layer"
+                initialized_params.update(
+                    self._clean_param_name(f"{prefix}.{name}") for name, _ in deepmoe_layer.named_parameters()
+                )
+            missing = {self._clean_param_name(name) for name, _ in self.named_parameters()} - initialized_params
+            if missing:
+                raise RuntimeError(f"{missing} is not initialized")
+        elif self.deepmoe_runtime is None:
+            super().init_weights()
+        else:
+            from xtuner.v1.utils import default_init_weights
+
+            initialized_params = default_init_weights(self)
+            for bank_index, bank in enumerate(self.deepmoe_runtime.banks):
+                bank.reset_parameters()
+                prefix = f"deepmoe_runtime.banks.{bank_index}"
+                initialized_params.update(
+                    self._clean_param_name(f"{prefix}.{name}") for name, _ in bank.named_parameters()
+                )
+            missing = {self._clean_param_name(name) for name, _ in self.named_parameters()} - initialized_params
+            if missing:
+                raise RuntimeError(f"{missing} is not initialized")
         # This persistent buffer is loaded from pretrained checkpoints, but the
         # from-scratch path must initialize it after meta tensors are materialized.
         for module in self.modules():
@@ -338,7 +494,7 @@ class MoE(BaseModel):
 
         TODO: refactor it later.
         """
-        if self.config.freeze_routers:
+        if self.config.freeze_routers or self.config.dispatcher == "deepmoe":
             return
 
         first_k_dense_replace = self.config.first_k_dense_replace
@@ -607,8 +763,9 @@ class MoE(BaseModel):
                         d2h_stream=self.offload_stream,
                         block_idx=layer_idx - self.config.first_k_dense_replace,
                         group="text",
-                        custom_check_fn=lambda x: x.data_ptr()
-                        in [hidden_states.data_ptr() for hidden_states in hidden_states_list],
+                        custom_check_fn=lambda x: (
+                            x.data_ptr() in [hidden_states.data_ptr() for hidden_states in hidden_states_list]
+                        ),
                         prefetch=True,
                         reserve_pin_memory=True,
                     ):
@@ -832,6 +989,9 @@ class MoE(BaseModel):
             output["router_weights"] = None
         self._mark_dynamic(seq_ctx)
         balancing_ctx, z_ctx = self._extract_aux_loss_ctx(loss_ctx)
+        deepmoe_balancing_losses: list[torch.Tensor] = []
+        deepmoe_z_losses: list[torch.Tensor] = []
+        deepmoe_token_counts: list[torch.Tensor] = []
         # Hoisted out of the per-layer accumulate path: mask is constant across layers.
         nonpad_indices = torch.nonzero(seq_ctx.mask, as_tuple=True)[1]
         non_pad_token = nonpad_indices.numel()
@@ -869,17 +1029,30 @@ class MoE(BaseModel):
                 if keep_router:
                     output["router_logits"][f"layer{idx}"] = self._maybe_offload_router(router_results)
                     output["router_weights"][f"layer{idx}"] = self._maybe_offload_router(router_weights)
-                hidden_states = self.aux_loss.accumulate(
-                    selected_router_weights=router_weights.index_select(0, nonpad_indices).contiguous().float(),
-                    selected_router_logits=router_results.index_select(0, nonpad_indices).contiguous().float(),
-                    selected_experts=router_topk_ids.index_select(0, nonpad_indices).contiguous(),
-                    hidden_states=hidden_states,
-                    balancing_ctx=balancing_ctx,
-                    z_ctx=z_ctx,
-                    num_tokens_local=non_pad_token,
-                    num_tokens_global=num_tokens_global,
-                    world_size=z_world_size,
-                )
+                if self.config.dispatcher == "deepmoe":
+                    typed_decoder_layer = cast(MoEDecoderLayer, decoder_layer)
+                    deepmoe_aux = typed_decoder_layer.take_deepmoe_aux()
+                    if deepmoe_aux is None or typed_decoder_layer.deepmoe_layer is None:
+                        raise RuntimeError(f"DeepMoE layer {idx} did not publish its auxiliary result")
+                    deepmoe_config = cast(Any, typed_decoder_layer.deepmoe_layer).config
+                    deepmoe_balancing_losses.append(deepmoe_aux.aux_loss * deepmoe_config.aux_loss_coef)
+                    deepmoe_z_losses.append(deepmoe_aux.z_loss * deepmoe_config.z_loss_coef)
+                    selected_ids = router_topk_ids.index_select(0, nonpad_indices).contiguous()
+                    deepmoe_token_counts.append(
+                        torch.bincount(selected_ids.reshape(-1), minlength=self.config.n_routed_experts)
+                    )
+                else:
+                    hidden_states = self.aux_loss.accumulate(
+                        selected_router_weights=router_weights.index_select(0, nonpad_indices).contiguous().float(),
+                        selected_router_logits=router_results.index_select(0, nonpad_indices).contiguous().float(),
+                        selected_experts=router_topk_ids.index_select(0, nonpad_indices).contiguous(),
+                        hidden_states=hidden_states,
+                        balancing_ctx=balancing_ctx,
+                        z_ctx=z_ctx,
+                        num_tokens_local=non_pad_token,
+                        num_tokens_global=num_tokens_global,
+                        world_size=z_world_size,
+                    )
 
             if self.config.return_hidden_states:
                 output["hidden_states"].append(hidden_states)
@@ -956,12 +1129,27 @@ class MoE(BaseModel):
             # Add to total loss
             output["mtp_loss"] = scaled_mtp_loss
 
-        split_aux_output = self.aux_loss.finalize(
-            balancing_ctx=balancing_ctx,
-            z_ctx=z_ctx,
-            non_pad_token=non_pad_token,
-        )
-        balancing_loss, z_loss, tokens_per_expert_global = split_aux_output
+        if self.config.dispatcher == "deepmoe":
+            zero = hidden_states.new_zeros((), dtype=torch.float32)
+            balancing_loss = sum(deepmoe_balancing_losses, zero)
+            z_loss = sum(deepmoe_z_losses, zero)
+            if deepmoe_token_counts:
+                tokens_per_expert_global = torch.stack(deepmoe_token_counts)
+            else:
+                tokens_per_expert_global = torch.zeros(
+                    (0, self.config.n_routed_experts),
+                    dtype=torch.long,
+                    device=hidden_states.device,
+                )
+            if dist.is_initialized() and tokens_per_expert_global.numel():
+                dist.all_reduce(tokens_per_expert_global, op=ReduceOp.SUM)
+        else:
+            split_aux_output = self.aux_loss.finalize(
+                balancing_ctx=balancing_ctx,
+                z_ctx=z_ctx,
+                non_pad_token=non_pad_token,
+            )
+            balancing_loss, z_loss, tokens_per_expert_global = split_aux_output
         if balancing_loss is not None:
             output["balancing_loss"] = balancing_loss
         if z_loss is not None:
@@ -1012,6 +1200,17 @@ class MoE(BaseModel):
                     layer_idx=layer_idx,
                 )
             else:
+                deepmoe_bank_index: int | None = None
+                deepmoe_router: MoEGate | None = None
+                deepmoe_layer: nn.Module | None = None
+                if self.deepmoe_runtime is not None:
+                    assert self.deepmoe_router_banks is not None
+                    deepmoe_bank_index = layer_idx % len(self.deepmoe_router_banks)
+                    deepmoe_router = cast(MoEGate, self.deepmoe_router_banks[deepmoe_bank_index])
+                elif config.dispatcher == "deepmoe":
+                    from xtuner.v1.integrations.deepmoe import build_deepmoe_layer
+
+                    deepmoe_layer = build_deepmoe_layer(config, layer_idx=layer_idx)
                 layers[str(layer_idx)] = MoEDecoderLayer(
                     hidden_size=config.hidden_size,
                     intermediate_size=config.intermediate_size,
@@ -1040,6 +1239,10 @@ class MoE(BaseModel):
                     ep_mesh=self.ep_mesh,
                     expert_tp_mesh=self.expert_tp_mesh,
                     ep_tp_mesh=self.ep_tp_mesh,
+                    deepmoe_runtime=self.deepmoe_runtime,
+                    deepmoe_bank_index=deepmoe_bank_index,
+                    deepmoe_router=deepmoe_router,
+                    deepmoe_layer=deepmoe_layer,
                 )
                 if self.config.freeze_routers:
                     layers[str(layer_idx)].gate.requires_grad_(False)
@@ -1126,6 +1329,10 @@ class MoE(BaseModel):
 
     @override
     def from_hf(self, hf_path: str | Path, strict: bool = True) -> tuple:
+        if self.config.dispatcher in {"deepmoe", "moonep", "ultraep"}:
+            from xtuner.v1.integrations.deepmoe import validate_deepmoe_model_config
+
+            validate_deepmoe_model_config(self.config, checkpoint_restore=True)
         # If model is built on meta device, we need to rebuild rotary embedding since from_hf will not
         # load the `inv_freq` of RotaryEmbedding which is a inpersisitent buffer.
         # This is used for training without FSDP.
@@ -1148,6 +1355,10 @@ class MoE(BaseModel):
         if fsdp_config.hsdp_sharding_size is not None and self.config.expert_tp_size > 1:
             raise NotImplementedError("HSDP with ExpertTP is not supported")
 
+        if self.config.dispatcher in {"deepmoe", "moonep", "ultraep"}:
+            from xtuner.v1.integrations.deepmoe import validate_deepmoe_model_config
+
+            validate_deepmoe_model_config(self.config, fsdp_config=fsdp_config)
         self.fsdp_config = fsdp_config
         assert self.fsdp_config.ep_size == self.config.ep_size
         self.mp_policy = MixedPrecisionPolicy(
@@ -1180,7 +1391,7 @@ class MoE(BaseModel):
                 param.requires_grad = False
 
         tp_enabled = self.expert_tp_mesh is not None and self.expert_tp_mesh.size() > 1
-        if self.ep_mesh.size() > 1 or tp_enabled:
+        if self.config.dispatcher != "deepmoe" and (self.ep_mesh.size() > 1 or tp_enabled):
             # 中文注释：不开 EP 但开启 expert TP 时，非 expert 参数仍是 TP rank 间的逻辑副本，
             # 需要显式放到 Replicate DTensor 上，后续梯度才会跨 expert TP 平均。
             self._replicate_other_params(self)
@@ -1196,6 +1407,15 @@ class MoE(BaseModel):
 
         for layer_idx, layer in tqdm(self.layers.items(), desc="[FSDP Sharding]"):
             layer_idx = int(layer_idx)
+            deepmoe_layer = getattr(layer, "deepmoe_layer", None)
+            if deepmoe_layer is not None:
+                self._fully_shard(
+                    mesh=self.expert_hsdp_mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=self.fsdp_config.reshard_after_forward,
+                    offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+                    module=deepmoe_layer,
+                )
             if self._should_recompute(
                 layer_idx=layer_idx,
                 mtp_idx=None,
@@ -1214,6 +1434,7 @@ class MoE(BaseModel):
                 reshard_after_forward=reshard_after_forward,
                 offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
                 module=layer,
+                extra_ignored_params=set(deepmoe_layer.parameters()) if deepmoe_layer is not None else None,
             )
 
         for layer_cur, layer_next in zip(
@@ -1331,11 +1552,21 @@ class MoE(BaseModel):
 
     @property
     def need_update_bias(self) -> bool:
+        if self.config.dispatcher == "deepmoe":
+            return False
         router_config = self.config.router
         return isinstance(router_config, NoAuxRouterConfig) and router_config.router_bias_update_speed > 0
 
     @torch.no_grad  # type: ignore
     def scale_and_reduce_grad(self):
+        if getattr(getattr(self, "config", None), "dispatcher", None) == "deepmoe":
+            self._scale_and_reduce_deepmoe_grads()
+            return
+        ep_enabled = self.ep_mesh is not None and self.ep_mesh.size() > 1
+        ultraep_runtime = self.deepmoe_runtime if getattr(self.deepmoe_runtime, "backend", None) == "ultraep" else None
+        if ultraep_runtime is not None:
+            ultraep_runtime.scale_expert_grads()
+
         # Bucket gradients that need a cross-rank reduction by their target process
         # group. Each bucket is reduced with a single coalesced NCCL all_reduce
         # instead of one launch per parameter, which used to dominate latency for
@@ -1348,7 +1579,11 @@ class MoE(BaseModel):
 
             expert_parallel_size = (
                 self.ep_mesh.size() if self.ep_mesh is not None else 1
-            ) * self.config.expert_tp_size
+            ) * getattr(getattr(self, "config", None), "expert_tp_size", 1)
+            is_ultraep_expert = ultraep_runtime is not None and name.startswith("deepmoe_runtime.banks.")
+            if is_ultraep_expert:
+                continue
+
             # 中文注释：expert 参数会在 EP 和 expert TP 维度上看到全量 token 梯度和，
             # 需要按参与该 expert 计算的 rank 数平均，才能对齐普通 DP/FSDP baseline。
             if expert_parallel_size > 1 and ".experts" in name:
@@ -1356,6 +1591,9 @@ class MoE(BaseModel):
                 continue
 
             if not isinstance(param, DTensor):
+                if ultraep_runtime is not None and ep_enabled:
+                    param.grad.div_(self.ep_mesh.size())  # type: ignore
+                    grads_by_group.setdefault(self.ep_mesh.get_group(), []).append(param.grad)  # type: ignore
                 continue
 
             replicate_dim_names = tuple(
@@ -1425,11 +1663,53 @@ class MoE(BaseModel):
         grad_norm = grad_norm.to(grads[0].dtype)
         return grad_norm, grouped_grads
 
+    def _scale_and_reduce_deepmoe_grads(self) -> None:
+        deepmoe_layers: list[Any] = [
+            cast(Any, layer).deepmoe_layer
+            for layer in self.layers.values()
+            if getattr(layer, "deepmoe_layer", None) is not None
+        ]
+        if self.fsdp_config is None:
+            for deepmoe_layer in deepmoe_layers:
+                deepmoe_layer.reduce_gradients()
+            dense_grads = [
+                parameter.grad
+                for name, parameter in self.trainable_parameters()
+                if ".deepmoe_layer." not in name and parameter.grad is not None
+            ]
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                with dist._coalescing_manager(group=dist.group.WORLD):
+                    for grad in dense_grads:
+                        grad.div_(dist.get_world_size())
+                        dist.all_reduce(grad, op=ReduceOp.SUM)
+            return
+
+        ep_grads: list[torch.Tensor] = []
+        ep_group: dist.ProcessGroup | None = None
+        ep_size = 1
+        for deepmoe_layer in deepmoe_layers:
+            ep_group = deepmoe_layer.topology.ep_group
+            ep_size = deepmoe_layer.topology.ep_size
+            placements = deepmoe_layer.parameter_placements()
+            for name, parameter in deepmoe_layer.named_parameters():
+                if "ep" not in placements[name].get("reduce", ()) or parameter.grad is None:
+                    continue
+                grad = parameter.grad.to_local() if isinstance(parameter.grad, DTensor) else parameter.grad
+                ep_grads.append(grad)
+        if ep_group is not None and ep_size > 1:
+            with dist._coalescing_manager(group=ep_group):
+                for grad in ep_grads:
+                    grad.div_(ep_size)
+                    dist.all_reduce(grad, op=ReduceOp.SUM, group=ep_group)
+
     def _init_device_mesh(self, fsdp_config: FSDPConfig):
         self.fsdp_config = fsdp_config
 
         device = DEVICE
         world_size = dist.get_world_size()
+        if self.config.dispatcher == "deepmoe":
+            self._init_deepmoe_device_mesh(device=device, world_size=world_size)
+            return
         expert_tp_size = self.config.expert_tp_size if self.config.expert_tp_size > 1 else 1
         experts_fsdp_size = world_size // (self.fsdp_config.ep_size * expert_tp_size)
 
@@ -1518,9 +1798,43 @@ class MoE(BaseModel):
             )
             self.fsdp_mesh = self.hsdp_mesh[f"{self.config.mesh_prefix}.hsdp_shard"]
 
+    def _init_deepmoe_device_mesh(self, *, device: str, world_size: int) -> None:
+        from deepmoe.integrations.parallel import build_xtuner_ep_fsdp_layout
+
+        layout = build_xtuner_ep_fsdp_layout(
+            self.config,
+            self.fsdp_config,
+            world_size=world_size,
+            global_rank=dist.get_rank(),
+        )
+        prefix = self.config.mesh_prefix
+        world_mesh = init_device_mesh(device, (world_size,), mesh_dim_names=(f"{prefix}.world",))
+        dense_mesh = world_mesh._unflatten(
+            0,
+            layout.dense_root_shape,
+            (f"{prefix}.dp_replicate", f"{prefix}.fsdp", f"{prefix}.tp"),
+        )
+        sparse_mesh = world_mesh._unflatten(
+            0,
+            layout.sparse_root_shape,
+            (f"{prefix}.dp_replicate", f"{prefix}.efsdp", f"{prefix}.ep"),
+        )
+
+        self._world_mesh = world_mesh
+        self.ep_mesh = sparse_mesh[f"{prefix}.ep"]
+        self.efsdp_mesh = sparse_mesh[f"{prefix}.efsdp"]
+        self.tp_mesh = dense_mesh[f"{prefix}.tp"]
+        self.fsdp_mesh = dense_mesh[f"{prefix}.fsdp"]
+        if layout.replicate_size > 1:
+            self.hsdp_mesh = dense_mesh[f"{prefix}.dp_replicate", f"{prefix}.fsdp"]
+            self.expert_hsdp_mesh = sparse_mesh[f"{prefix}.dp_replicate", f"{prefix}.efsdp"]
+        else:
+            self.hsdp_mesh = None
+            self.expert_hsdp_mesh = self.efsdp_mesh
+
     def _replicate_other_params(self, model: nn.Module):
         def traverse(module: nn.Module) -> None:
-            if isinstance(module, MoEBlock):
+            if isinstance(module, MoEBlock) or module.__class__.__module__.startswith("deepmoe."):
                 # Expert params are already partitioned by build_grouped_linear.
                 return
             for name, param in module.named_parameters(recurse=False):
@@ -1637,3 +1951,54 @@ class MoE(BaseModel):
     ) -> MoEModelOutputs: ...
 
     __call__ = nn.Module.__call__
+
+
+def build_deepmoe_model(
+    config: MoEConfig,
+    *,
+    device: torch.device | str | int | None = None,
+    initialize: bool = True,
+) -> MoE:
+    """Build the supported non-FSDP DeepMoE model directly on CUDA."""
+    from xtuner.v1.integrations.deepmoe import validate_deepmoe_model_config
+
+    validate_deepmoe_model_config(config)
+    if device is None:
+        resolved_device = torch.device("cuda", torch.cuda.current_device())
+    elif isinstance(device, int):
+        resolved_device = torch.device("cuda", device)
+    else:
+        resolved_device = torch.device(device)
+    if resolved_device.type != "cuda":
+        raise ValueError(f"DeepMoE model construction requires a CUDA device, got {resolved_device}")
+
+    model: MoE | None = None
+    try:
+        with torch.device(resolved_device):
+            model = config.build()
+        if initialize:
+            model.init_weights()
+        model.train()
+    except BaseException:
+        if model is not None:
+            model._close_deepmoe_after_construction_failure()
+        raise
+    return model
+
+
+@contextmanager
+def deepmoe_model_session(
+    config: MoEConfig,
+    *,
+    device: torch.device | str | int | None = None,
+    initialize: bool = True,
+) -> Iterator[MoE]:
+    """Yield a DeepMoE model and close runtime resources before PG teardown."""
+    model = build_deepmoe_model(config, device=device, initialize=initialize)
+    try:
+        yield model
+    except BaseException:
+        model.close(collective=False)
+        raise
+    else:
+        model.close()

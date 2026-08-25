@@ -1,5 +1,6 @@
 import re
 from pathlib import Path
+from typing import Literal
 
 import torch
 from pydantic import Field
@@ -169,6 +170,76 @@ class Qwen3MoE30BA3Config(Qwen3MoEConfig):
     )
     balancing_loss_cfg: BalancingLossConfig | None = BalancingLossConfig()
     z_loss_cfg: ZLossConfig | None = None
+
+
+class Qwen3MetaMoE10BA1BConfig(Qwen3MoEConfig):
+    """Checkpoint-free Qwen3 MetaMoE structure for DeepMoE MoonEP validation."""
+
+    vocab_size: int = 151936
+    max_position_embeddings: int = 32768
+    pad_token_id: int | None = None
+    eos_token_id: int = 151643
+    bos_token_id: int = 151643
+    num_hidden_layers: int = 16
+    max_window_layers: int = 16
+    hidden_size: int = 2048
+    intermediate_size: int = 6144
+    rms_norm_eps: float = 1e-6
+    rope_parameters_cfg: RopeParametersConfig = Field(
+        default_factory=lambda: RopeParametersConfig(rope_theta=1000000.0)
+    )
+    hidden_act: str = "silu"
+    model_type: str = "qwen3_meta_moe"
+    attention: MHAConfig = MHAConfig(
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        head_dim=128,
+        dropout=0.0,
+        qkv_bias=False,
+        qk_norm=True,
+        o_bias=False,
+        sliding_window=None,
+    )
+    use_sliding_window: bool = False
+    tie_word_embeddings: bool = False
+    n_routed_experts: int = 2048
+    n_shared_experts: int = 0
+    num_experts_per_tok: int = 8
+    first_k_dense_replace: int = 0
+    hidden_factor: float = 1.0
+    moe_intermediate_size: int = 768
+    router: GreedyRouterConfig = GreedyRouterConfig(
+        scoring_func="softmax",
+        norm_topk_prob=True,
+        router_scaling_factor=1.0,
+    )
+    balancing_loss_cfg: BalancingLossConfig | None = BalancingLossConfig(
+        balancing_loss_alpha=0.001,
+    )
+    z_loss_cfg: ZLossConfig | None = None
+    dispatcher: Literal["moonep"] = "moonep"
+    ep_size: int = 4
+    compile_cfg: bool = False
+    router_async_offload: bool = False
+
+    # Projection MetaMoE topology remains structural metadata until its
+    # attention-side router/checkpoint contract is implemented.
+    meta_moe: bool = True
+    meta_moe_act: bool = False
+    moe_meta_keys_mode: Literal["independent"] = "independent"
+    linear_to_moe: bool = True
+    moe_q_proj: bool = True
+    moe_k_proj: bool = True
+    moe_v_proj: bool = True
+    moe_o_proj: bool = True
+    moe_proj_n_routed_experts: int = 32
+    moe_proj_num_experts_per_tok: int = 2
+    moe_proj_intermediate_size: int = 768
+    meta_mlp: bool = True
+    meta_q_proj: bool = True
+    meta_k_proj: bool = True
+    meta_v_proj: bool = True
+    meta_o_proj: bool = True
 
 
 class Qwen3MoE235BA22Config(Qwen3MoEConfig):

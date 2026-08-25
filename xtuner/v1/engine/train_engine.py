@@ -153,6 +153,16 @@ class TrainEngine:
         self.model_cfg = model_cfg
         self.optim_cfg = optim_cfg
         self.fsdp_cfg = fsdp_cfg
+        if getattr(model_cfg, "dispatcher", None) in {"deepmoe", "moonep", "ultraep"}:
+            from xtuner.v1.integrations.deepmoe import validate_deepmoe_model_config
+
+            # TrainEngine currently constructs on meta and then applies FSDP.
+            # DeepMoE MoonEP phase 1 has an explicit direct-CUDA builder.
+            validate_deepmoe_model_config(
+                model_cfg,
+                fsdp_config=fsdp_cfg,
+                intra_layer_micro_batch=intra_layer_micro_batch,
+            )
         self.model = self.build_model()
         self.optimizer = self.build_optimizer(optim_cfg)
         self.intra_layer_micro_batch = intra_layer_micro_batch
