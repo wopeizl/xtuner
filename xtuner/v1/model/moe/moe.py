@@ -330,6 +330,7 @@ class MoE(BaseModel):
             architecture=config.ultraep_architecture,
             num_sms_dispatch=config.ultraep_num_sms,
             num_sms_combine=config.ultraep_num_sms,
+            defer_runtime=torch.get_default_device().type == "meta",
             **common,
         )
 
@@ -1400,7 +1401,7 @@ class MoE(BaseModel):
                 param.requires_grad = False
 
         tp_enabled = self.expert_tp_mesh is not None and self.expert_tp_mesh.size() > 1
-        if self.config.dispatcher not in {"deepmoe", "moonep"} and (
+        if self.config.dispatcher not in {"deepmoe", "moonep", "ultraep"} and (
             self.ep_mesh.size() > 1 or tp_enabled
         ):
             # 中文注释：不开 EP 但开启 expert TP 时，非 expert 参数仍是 TP rank 间的逻辑副本，
@@ -1556,6 +1557,11 @@ class MoE(BaseModel):
             mp_policy=mp_policy,
             reshard_after_forward=self.fsdp_config.reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+            extra_ignored_params=(
+                set(self.deepmoe_runtime.parameters())
+                if getattr(self.deepmoe_runtime, "backend", None) == "ultraep"
+                else None
+            ),
         )
         self.set_modules_to_forward_prefetch([self.embed_tokens, self.layers["0"]])  # type: ignore
 
@@ -1565,8 +1571,16 @@ class MoE(BaseModel):
 
         self._init_load_spec()
         self._to_empty_meta()
-        if getattr(self.deepmoe_runtime, "backend", None) == "moonep":
+        if getattr(self.deepmoe_runtime, "backend", None) in {"moonep", "ultraep"}:
             self.deepmoe_runtime.materialize_runtime()
+        if getattr(self.deepmoe_runtime, "backend", None) == "ultraep":
+            dp_group = None
+            if self.expert_hsdp_mesh is not None and self.expert_hsdp_mesh.size() > 1:
+                dp_mesh = self.expert_hsdp_mesh
+                if len(dp_mesh.mesh_dim_names) > 1:
+                    dp_mesh = dp_mesh._flatten()
+                dp_group = dp_mesh.get_group()
+            self.deepmoe_runtime.configure_data_parallel(dp_group)
         return self
 
     @property
@@ -1734,7 +1748,7 @@ class MoE(BaseModel):
 
         device = DEVICE
         world_size = dist.get_world_size()
-        if self.config.dispatcher in {"deepmoe", "moonep"}:
+        if self.config.dispatcher in {"deepmoe", "moonep", "ultraep"}:
             self._init_deepmoe_device_mesh(device=device, world_size=world_size)
             return
         expert_tp_size = self.config.expert_tp_size if self.config.expert_tp_size > 1 else 1
