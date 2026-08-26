@@ -155,6 +155,12 @@ class MoEConfig(TransformerConfig):
     ] = None
     moonep_sequence_length: Annotated[int, Parameter(group="moe")] = 32
     moonep_num_sms: Annotated[int | None, Parameter(group="moe")] = None
+    moonep_planning_backend: Annotated[
+        Literal["auto", "cutedsl", "triton", "torch"], Parameter(group="moe")
+    ] = "auto"
+    moonep_grad_reduce_backend: Annotated[
+        Literal["auto", "cutedsl", "triton", "torch"], Parameter(group="moe")
+    ] = "auto"
     ultraep_max_tokens_per_rank: Annotated[int, Parameter(group="moe")] = 32
     ultraep_num_redundant_experts_per_rank: Annotated[int, Parameter(group="moe")] = 1
     ultraep_architecture: Annotated[Literal["auto", "sm90", "sm100"], Parameter(group="moe")] = "auto"
@@ -311,6 +317,9 @@ class MoE(BaseModel):
                 backend="moonep",
                 sequence_length=config.moonep_sequence_length,
                 num_sms=config.moonep_num_sms,
+                planning_backend=config.moonep_planning_backend,
+                grad_reduce_backend=config.moonep_grad_reduce_backend,
+                defer_runtime=torch.get_default_device().type == "meta",
                 **common,
             )
         return build_deepmoe_runtime(
@@ -1391,7 +1400,9 @@ class MoE(BaseModel):
                 param.requires_grad = False
 
         tp_enabled = self.expert_tp_mesh is not None and self.expert_tp_mesh.size() > 1
-        if self.config.dispatcher != "deepmoe" and (self.ep_mesh.size() > 1 or tp_enabled):
+        if self.config.dispatcher not in {"deepmoe", "moonep"} and (
+            self.ep_mesh.size() > 1 or tp_enabled
+        ):
             # 中文注释：不开 EP 但开启 expert TP 时，非 expert 参数仍是 TP rank 间的逻辑副本，
             # 需要显式放到 Replicate DTensor 上，后续梯度才会跨 expert TP 平均。
             self._replicate_other_params(self)
@@ -1404,6 +1415,20 @@ class MoE(BaseModel):
         mp_policy = MixedPrecisionPolicy(
             param_dtype=self.fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype
         )
+
+        if getattr(self.deepmoe_runtime, "backend", None) == "moonep":
+            expert_master_mesh = self.expert_hsdp_mesh
+            for bank in self.deepmoe_runtime.banks:
+                self._fully_shard(
+                    mesh=expert_master_mesh,
+                    mp_policy=MixedPrecisionPolicy(
+                        param_dtype=torch.float32,
+                        reduce_dtype=torch.float32,
+                    ),
+                    reshard_after_forward=True,
+                    offload_policy=None,
+                    module=bank,
+                )
 
         for layer_idx, layer in tqdm(self.layers.items(), desc="[FSDP Sharding]"):
             layer_idx = int(layer_idx)
@@ -1540,6 +1565,8 @@ class MoE(BaseModel):
 
         self._init_load_spec()
         self._to_empty_meta()
+        if getattr(self.deepmoe_runtime, "backend", None) == "moonep":
+            self.deepmoe_runtime.materialize_runtime()
         return self
 
     @property
@@ -1707,7 +1734,7 @@ class MoE(BaseModel):
 
         device = DEVICE
         world_size = dist.get_world_size()
-        if self.config.dispatcher == "deepmoe":
+        if self.config.dispatcher in {"deepmoe", "moonep"}:
             self._init_deepmoe_device_mesh(device=device, world_size=world_size)
             return
         expert_tp_size = self.config.expert_tp_size if self.config.expert_tp_size > 1 else 1
