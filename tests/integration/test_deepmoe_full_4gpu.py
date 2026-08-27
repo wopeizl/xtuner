@@ -51,6 +51,8 @@ def _config() -> SimpleNamespace:
         moe_intermediate_size=16,
         n_shared_experts=1,
         ep_size=2,
+        deepmoe_transport=os.environ.get("DEEPMOE_TEST_TRANSPORT", "native"),
+        deepmoe_max_tokens_per_rank=6,
         balancing_loss_cfg=SimpleNamespace(balancing_loss_alpha=0.01),
         z_loss_cfg=SimpleNamespace(z_loss_alpha=0.001),
     )

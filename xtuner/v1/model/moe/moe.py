@@ -102,6 +102,20 @@ MOE_EP_COMPILE_CFG = MOE_NON_EP_COMPILE_CFG.copy()
 MOE_EP_COMPILE_CFG.pop("xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDecoderLayer.forward")
 
 
+def _checkpoint_moe_decoder_layer(layer: nn.Module, deepmoe_backend: str | None) -> nn.Module:
+    """Apply activation recompute without replaying stateful expert runtimes."""
+
+    if deepmoe_backend in {"moonep", "ultraep"}:
+        # These runtimes already recompute expert math in their custom autograd
+        # backward.  Replaying the whole decoder layer would also repeat
+        # stateful dispatch/placement and generation bookkeeping.  Checkpoint
+        # only the pure attention subgraph; expert activations remain covered
+        # by the runtime's own recompute implementation.
+        cast(Any, layer)._checkpoint_attention = True
+        return layer
+    return checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.REENTRANT)
+
+
 class MoEModelOutputs(ModelOutputs):
     router_logits: dict[str, torch.Tensor] | None = None
     router_weights: dict[str, torch.Tensor] | None = None
@@ -153,6 +167,16 @@ class MoEConfig(TransformerConfig):
         Literal["deepep", "all2all", "agrs", "deepmoe", "moonep", "ultraep"] | None,
         Parameter(group="moe"),
     ] = None
+    deepmoe_transport: Annotated[
+        Literal["native", "deepep", "nccl_ep"], Parameter(group="moe")
+    ] = "native"
+    deepmoe_max_tokens_per_rank: Annotated[int, Parameter(group="moe")] = 8192
+    deepmoe_num_sms: Annotated[int, Parameter(group="moe")] = 0
+    deepmoe_num_channels: Annotated[int, Parameter(group="moe")] = 0
+    deepmoe_buffer_mib: Annotated[int, Parameter(group="moe")] = 1024
+    deepmoe_transport_fallback: Annotated[
+        Literal["error", "native"], Parameter(group="moe")
+    ] = "error"
     moonep_sequence_length: Annotated[int, Parameter(group="moe")] = 32
     moonep_num_sms: Annotated[int | None, Parameter(group="moe")] = None
     moonep_planning_backend: Annotated[
@@ -1035,18 +1059,30 @@ class MoE(BaseModel):
                         position_embeddings=position_embeddings,
                         seq_ctx=seq_ctx,
                     )
-                hidden_states, router_results, router_weights, router_topk_ids = layer_results
+                if self.config.dispatcher == "deepmoe":
+                    (
+                        hidden_states,
+                        router_results,
+                        router_weights,
+                        router_topk_ids,
+                        deepmoe_aux_loss,
+                        deepmoe_z_loss,
+                    ) = layer_results
+                else:
+                    hidden_states, router_results, router_weights, router_topk_ids = layer_results
                 if keep_router:
                     output["router_logits"][f"layer{idx}"] = self._maybe_offload_router(router_results)
                     output["router_weights"][f"layer{idx}"] = self._maybe_offload_router(router_weights)
                 if self.config.dispatcher == "deepmoe":
-                    typed_decoder_layer = cast(MoEDecoderLayer, decoder_layer)
-                    deepmoe_aux = typed_decoder_layer.take_deepmoe_aux()
-                    if deepmoe_aux is None or typed_decoder_layer.deepmoe_layer is None:
-                        raise RuntimeError(f"DeepMoE layer {idx} did not publish its auxiliary result")
-                    deepmoe_config = cast(Any, typed_decoder_layer.deepmoe_layer).config
-                    deepmoe_balancing_losses.append(deepmoe_aux.aux_loss * deepmoe_config.aux_loss_coef)
-                    deepmoe_z_losses.append(deepmoe_aux.z_loss * deepmoe_config.z_loss_coef)
+                    balancing_cfg = self.config.balancing_loss_cfg
+                    z_loss_cfg = self.config.z_loss_cfg
+                    deepmoe_balancing_losses.append(
+                        deepmoe_aux_loss
+                        * (float(balancing_cfg.balancing_loss_alpha) if balancing_cfg is not None else 0.0)
+                    )
+                    deepmoe_z_losses.append(
+                        deepmoe_z_loss * (float(z_loss_cfg.z_loss_alpha) if z_loss_cfg is not None else 0.0)
+                    )
                     selected_ids = router_topk_ids.index_select(0, nonpad_indices).contiguous()
                     deepmoe_token_counts.append(
                         torch.bincount(selected_ids.reshape(-1), minlength=self.config.n_routed_experts)
@@ -1446,7 +1482,10 @@ class MoE(BaseModel):
                 layer_idx=layer_idx,
                 mtp_idx=None,
             ):
-                layer = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.REENTRANT)
+                layer = _checkpoint_moe_decoder_layer(
+                    layer,
+                    getattr(self.deepmoe_runtime, "backend", None),
+                )
 
             self.layers[str(layer_idx)] = layer
             if layer_idx >= len(self.layers) - 1 and self.mtp_block is None:

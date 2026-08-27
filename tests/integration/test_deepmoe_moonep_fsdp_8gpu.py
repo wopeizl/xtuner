@@ -46,7 +46,7 @@ def _config() -> Qwen3MoEConfig:
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
-        num_hidden_layers=1,
+        num_hidden_layers=2,
         hidden_size=512,
         intermediate_size=1024,
         rms_norm_eps=1e-6,
@@ -79,12 +79,15 @@ def _run_moonep_ep8_materializes_after_fsdp_and_runs_backward() -> None:
     assert runtime.runtime_buffers == ()
     assert all(parameter.device.type == "meta" for parameter in runtime.parameters())
 
-    model.fully_shard(FSDPConfig(ep_size=8, tp_size=1))
+    model.fully_shard(FSDPConfig(ep_size=8, tp_size=1, recompute_ratio=1.0))
     model.init_weights()
 
     assert len(runtime.runtime_buffers) == 1
     assert len(runtime.storages) == 3
     assert len({id(bank._buffer) for bank in runtime.banks}) == 1
+    assert not hasattr(model.layers["0"], "_checkpoint_wrapped_module")
+    assert model.layers["0"]._checkpoint_attention is True
+    assert model.layers["1"]._checkpoint_attention is False
 
     hidden = torch.randn(8, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     base = torch.arange(8, device="cuda", dtype=torch.int64).unsqueeze(1)

@@ -8,6 +8,7 @@ from torch.autograd.function import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from xtuner.v1.config.generate import GenerateConfig
 from xtuner.v1.data_proto import SequenceContext
@@ -282,7 +283,7 @@ class MoEDecoderLayer(nn.Module):
 
         object.__setattr__(self, "_deepmoe_runtime", deepmoe_runtime)
         self._deepmoe_bank_index = deepmoe_bank_index
-        self._last_deepmoe_aux: Any | None = None
+        self._checkpoint_attention = False
         if deepmoe_layer is not None:
             if deepmoe_runtime is not None:
                 raise ValueError("DeepMoE full layer and specialized runtime are mutually exclusive")
@@ -341,16 +342,6 @@ class MoEDecoderLayer(nn.Module):
                 training_dtype="fp8" if float8_cfg is not None else "bf16",
                 generate_dtype=generate_config.dtype if generate_config is not None else "bf16",
             )
-
-    def take_deepmoe_aux(self) -> Any | None:
-        """Take the DeepMoE auxiliary result produced by the last forward.
-
-        Returns:
-            Any | None: DeepMoE ``MoEAux`` for the last invocation, if this is
-                a complete DeepMoE layer.
-        """
-        aux, self._last_deepmoe_aux = self._last_deepmoe_aux, None
-        return aux
 
     def forward(
         self,
@@ -440,7 +431,7 @@ class MoEDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         seq_ctx: SequenceContext,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[HiddenStates, RouterLogits, RouterWeights, RouterTopKIds]:
+    ) -> tuple[torch.Tensor, ...]:
         if self.deepmoe_layer is not None:
             if getattr(seq_ctx, "rollout_routed_experts", None) is not None:
                 raise RuntimeError("DeepMoE full layer does not support replaying XTuner rollout routes")
@@ -455,7 +446,6 @@ class MoEDecoderLayer(nn.Module):
                 token_mask=seq_ctx.mask,
                 collect_router_stats=True,
             )
-            self._last_deepmoe_aux = aux
             if aux.router_logits is None or aux.topk_weights is None or aux.topk_expert_ids is None:
                 raise RuntimeError("DeepMoE full layer did not return router statistics")
             output = self._post_moe_forward(
@@ -463,7 +453,19 @@ class MoEDecoderLayer(nn.Module):
                 residual=residual,
                 shared_experts_out=None,
             )
-            return output, aux.router_logits, aux.topk_weights, aux.topk_expert_ids
+            # Auxiliary losses must be explicit checkpoint outputs.  Reentrant
+            # checkpointing executes the first forward under no_grad(), so a
+            # side-channel value stored on ``self`` has no usable autograd
+            # graph.  Returning the losses makes the replayed tensors part of
+            # CheckpointFunction.backward's output contract.
+            return (
+                output,
+                aux.router_logits,
+                aux.topk_weights,
+                aux.topk_expert_ids,
+                aux.aux_loss,
+                aux.z_loss,
+            )
 
         deepmoe_runtime = self._deepmoe_runtime
         generation = None
@@ -787,12 +789,37 @@ class MoEDecoderLayer(nn.Module):
 
         # Self Attention
         if state == ForwardState.TRAINING:
-            attn_outputs: AttnOutputs = self.self_attn(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                seq_ctx=seq_ctx,
-            )
-            hidden_states = attn_outputs["projected_output"]
+            if self._checkpoint_attention:
+                # Attention returns an AttnOutputs dict, which cannot cross the
+                # reentrant CheckpointFunction boundary.  Only projected_output
+                # is consumed by the training decoder, so make that tensor the
+                # explicit checkpoint output without wrapping/reparenting the
+                # attention module or changing its state-dict paths.
+                def projected_attention(
+                    value: torch.Tensor,
+                    cos: torch.Tensor,
+                    sin: torch.Tensor,
+                ) -> torch.Tensor:
+                    outputs: AttnOutputs = self.self_attn(
+                        hidden_states=value,
+                        position_embeddings=(cos, sin),
+                        seq_ctx=seq_ctx,
+                    )
+                    return outputs["projected_output"]
+
+                hidden_states = checkpoint(
+                    projected_attention,
+                    hidden_states,
+                    *position_embeddings,
+                    use_reentrant=True,
+                )
+            else:
+                attn_outputs: AttnOutputs = self.self_attn(
+                    hidden_states=hidden_states,
+                    position_embeddings=position_embeddings,
+                    seq_ctx=seq_ctx,
+                )
+                hidden_states = attn_outputs["projected_output"]
         elif state == ForwardState.PREFILLING:
             assert past_key_values is not None, "past_key_values should be provided in pre-filling state"
             hidden_states = self.self_attn.prefilling(  # type: ignore

@@ -84,6 +84,13 @@ def validate_deepmoe_model_config(
             failures.append("n_routed_experts must be positive and divisible by ep_size")
         if int(getattr(config, "moe_intermediate_size", 0)) <= 0:
             failures.append("moe_intermediate_size must be positive")
+        transport = getattr(config, "deepmoe_transport", "native")
+        if transport not in {"native", "deepep", "nccl_ep"}:
+            failures.append("deepmoe_transport must be native, deepep, or nccl_ep")
+        if transport != "native" and ep_size <= 1:
+            failures.append(f"deepmoe_transport={transport} requires ep_size > 1")
+        if int(getattr(config, "deepmoe_max_tokens_per_rank", 8192)) <= 0:
+            failures.append("deepmoe_max_tokens_per_rank must be positive")
         if failures:
             raise RuntimeError("DeepMoE full-layer unsupported configuration: " + "; ".join(failures))
         return
@@ -146,6 +153,14 @@ def build_deepmoe_layer(config: Any, *, layer_idx: int) -> torch.nn.Module:
         ),
         z_loss_coef=float(z_loss_cfg.z_loss_alpha) if z_loss_cfg is not None else 0.0,
         compute_dtype=torch.bfloat16,
+        transport_provider=str(getattr(config, "deepmoe_transport", "native")),
+        transport_max_tokens_per_rank=int(
+            getattr(config, "deepmoe_max_tokens_per_rank", 8192)
+        ),
+        transport_num_sms=int(getattr(config, "deepmoe_num_sms", 0)),
+        transport_num_channels=int(getattr(config, "deepmoe_num_channels", 0)),
+        transport_buffer_mib=int(getattr(config, "deepmoe_buffer_mib", 1024)),
+        transport_fallback=str(getattr(config, "deepmoe_transport_fallback", "error")),
     )
     return MoELayer(deepmoe_config, layer_idx=layer_idx)
 

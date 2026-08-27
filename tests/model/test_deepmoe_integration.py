@@ -4,14 +4,16 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from xtuner.v1.config.fsdp import FSDPConfig
 from xtuner.v1.integrations.deepmoe import build_deepmoe_layer, validate_deepmoe_model_config
-from xtuner.v1.model.moe.moe import MoE
+from xtuner.v1.model.moe.moe import MoE, _checkpoint_moe_decoder_layer
 from xtuner.v1.model.moe.qwen3 import Qwen3MetaMoE10BA1BConfig, Qwen3MoEConfig
 from xtuner.v1.module.attention import MHAConfig
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEDecoderLayer
 from xtuner.v1.module.router import GreedyRouterConfig
+from xtuner.v1.utils import ForwardState
 
 
 class _FakeRuntime:
@@ -93,11 +95,12 @@ def _bare_deepmoe_layer(runtime):
 
 
 class _FakeCompleteDeepMoE(nn.Module):
-    def __init__(self):
+    def __init__(self, *, differentiable_aux=False):
         super().__init__()
         self.router = nn.Linear(6, 8, bias=False)
         self.config = SimpleNamespace(aux_loss_coef=0.1, z_loss_coef=0.2)
         self.calls = []
+        self.differentiable_aux = differentiable_aux
 
     def forward(self, hidden, *, token_mask, collect_router_stats):
         self.calls.append((hidden, token_mask, collect_router_stats))
@@ -105,9 +108,11 @@ class _FakeCompleteDeepMoE(nn.Module):
         logits = torch.randn(tokens, 8)
         topk_ids = torch.tensor([[0, 1]]).expand(tokens, -1)
         topk_weights = torch.full((tokens, 2), 0.5)
+        aux_loss = hidden.square().mean() if self.differentiable_aux else torch.tensor(2.0)
+        z_loss = hidden.mean() if self.differentiable_aux else torch.tensor(3.0)
         aux = SimpleNamespace(
-            aux_loss=torch.tensor(2.0),
-            z_loss=torch.tensor(3.0),
+            aux_loss=aux_loss,
+            z_loss=z_loss,
             router_logits=logits,
             topk_expert_ids=topk_ids,
             topk_weights=topk_weights,
@@ -124,7 +129,6 @@ def test_decoder_delegates_the_complete_moe_block_to_deepmoe():
     layer.n_shared_experts = 1
     layer.shared_experts = None
     layer.deepmoe_layer = deepmoe_layer
-    layer._last_deepmoe_aux = None
     object.__setattr__(layer, "_deepmoe_runtime", None)
 
     def pre_moe_input(self, *, hidden_states, **_kwargs):
@@ -133,7 +137,7 @@ def test_decoder_delegates_the_complete_moe_block_to_deepmoe():
     layer._pre_moe_input_forward = MethodType(pre_moe_input, layer)
     hidden = torch.randn(1, 4, 6)
     mask = torch.ones(1, 4, dtype=torch.bool)
-    output, logits, weights, expert_ids = layer._forward(
+    output, logits, weights, expert_ids, aux_loss, z_loss = layer._forward(
         hidden_states=hidden,
         seq_ctx=SimpleNamespace(mask=mask),
         position_embeddings=(torch.empty(0), torch.empty(0)),
@@ -145,9 +149,125 @@ def test_decoder_delegates_the_complete_moe_block_to_deepmoe():
     assert called_hidden is hidden and called_mask is mask and collect_router_stats is True
     assert logits.shape == (4, 8)
     assert weights.shape == expert_ids.shape == (4, 2)
-    aux = layer.take_deepmoe_aux()
-    assert aux is not None and aux.aux_loss.item() == 2.0 and aux.z_loss.item() == 3.0
-    assert layer.take_deepmoe_aux() is None
+    assert aux_loss.item() == 2.0
+    assert z_loss.item() == 3.0
+
+
+def test_complete_deepmoe_aux_losses_survive_reentrant_checkpoint():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    deepmoe_layer = _FakeCompleteDeepMoE(differentiable_aux=True)
+    layer = MoEDecoderLayer.__new__(MoEDecoderLayer)
+    nn.Module.__init__(layer)
+    layer.layer_idx = 2
+    layer.hidden_factor = 1.0
+    layer.n_shared_experts = 0
+    layer.shared_experts = None
+    layer.deepmoe_layer = deepmoe_layer
+    object.__setattr__(layer, "_deepmoe_runtime", None)
+
+    def pre_moe_input(self, *, hidden_states, **_kwargs):
+        return torch.zeros_like(hidden_states), hidden_states
+
+    layer._pre_moe_input_forward = MethodType(pre_moe_input, layer)
+    hidden = torch.randn(1, 4, 6, device=device, requires_grad=True)
+    mask = torch.ones(1, 4, dtype=torch.bool, device=device)
+
+    outputs = checkpoint(
+        lambda value: layer._forward(
+            hidden_states=value,
+            seq_ctx=SimpleNamespace(mask=mask),
+            position_embeddings=(torch.empty(0), torch.empty(0)),
+        ),
+        hidden,
+        use_reentrant=True,
+    )
+    aux_loss, z_loss = outputs[-2:]
+    (aux_loss + z_loss).backward()
+
+    expected = 2 * hidden.detach() / hidden.numel() + torch.full_like(hidden, 1 / hidden.numel())
+    torch.testing.assert_close(hidden.grad, expected)
+    assert len(deepmoe_layer.calls) == 2
+
+
+class _CountingAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def forward(
+        self,
+        hidden: torch.Tensor | None = None,
+        *,
+        hidden_states: torch.Tensor | None = None,
+        position_embeddings=None,
+        seq_ctx=None,
+    ) -> dict[str, torch.Tensor]:
+        del position_embeddings, seq_ctx
+        value = hidden if hidden is not None else hidden_states
+        assert value is not None
+        self.calls += 1
+        return {"projected_output": value.square()}
+
+
+class _StatefulRuntimeLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = _CountingAttention()
+        self._checkpoint_attention = False
+        self.runtime_calls = 0
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self._checkpoint_attention:
+            hidden = checkpoint(
+                lambda value: self.self_attn(value)["projected_output"],
+                hidden,
+                use_reentrant=True,
+            )
+        else:
+            hidden = self.self_attn(hidden)["projected_output"]
+        self.runtime_calls += 1
+        return hidden * 3
+
+
+@pytest.mark.parametrize("backend", ["moonep", "ultraep"])
+def test_specialized_deepmoe_recompute_does_not_replay_stateful_runtime(backend):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    layer = _StatefulRuntimeLayer()
+    wrapped = _checkpoint_moe_decoder_layer(layer, backend)
+    hidden = torch.randn(4, device=device, requires_grad=True)
+
+    wrapped(hidden).sum().backward()
+
+    assert wrapped is layer
+    assert layer._checkpoint_attention is True
+    assert layer.self_attn.calls == 2
+    assert layer.runtime_calls == 1
+
+
+def test_decoder_attention_checkpoint_replays_tensor_output_only():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    layer = MoEDecoderLayer.__new__(MoEDecoderLayer)
+    nn.Module.__init__(layer)
+    layer.input_layernorm = nn.Identity()
+    layer.post_attention_layernorm = nn.Identity()
+    layer.self_attn = _CountingAttention()
+    layer._checkpoint_attention = True
+    hidden = torch.randn(1, 4, 6, device=device, requires_grad=True)
+    position_embeddings = (
+        torch.randn(1, 4, 6, device=device),
+        torch.randn(1, 4, 6, device=device),
+    )
+
+    _, moe_input = layer._pre_moe_input_forward(
+        hidden_states=hidden,
+        seq_ctx=SimpleNamespace(),
+        position_embeddings=position_embeddings,
+        state=ForwardState.TRAINING,
+    )
+    moe_input.sum().backward()
+
+    torch.testing.assert_close(hidden.grad, 1 + 2 * hidden.detach())
+    assert layer.self_attn.calls == 2
 
 
 def test_complete_deepmoe_builder_owns_router_routed_and_shared_experts():
@@ -172,6 +292,23 @@ def test_complete_deepmoe_builder_owns_router_routed_and_shared_experts():
     assert layer.shared_expert.c_fc.out_features == 16
     assert layer.config.aux_loss_coef == 0.01
     assert layer.config.z_loss_coef == 0.02
+    assert layer.config.transport_provider == "native"
+
+
+def test_complete_deepmoe_rejects_accelerated_transport_without_ep():
+    config = SimpleNamespace(
+        dispatcher="deepmoe",
+        deepmoe_transport="nccl_ep",
+        hidden_size=8,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=16,
+        n_shared_experts=1,
+        ep_size=1,
+    )
+
+    with pytest.raises(RuntimeError, match="nccl_ep requires ep_size > 1"):
+        validate_deepmoe_model_config(config)
 
 
 def test_complete_deepmoe_model_uses_deepmoe_initialization():
